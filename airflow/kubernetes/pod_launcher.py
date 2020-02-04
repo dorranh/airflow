@@ -16,11 +16,13 @@
 # under the License.
 """Launches PODs"""
 import json
+import threading
 import time
 from datetime import datetime as dt
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import tenacity
+import urllib3
 from kubernetes import client, watch
 from kubernetes.client.models.v1_pod import V1Pod
 from kubernetes.client.rest import ApiException
@@ -32,7 +34,6 @@ from airflow.kubernetes.pod_generator import PodDefaults
 from airflow.settings import pod_mutation_hook
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import State
-
 from .kube_client import get_kube_client
 
 
@@ -119,10 +120,19 @@ class PodLauncher(LoggingMixin):
         return self._monitor_pod(pod, get_logs)
 
     def _monitor_pod(self, pod: V1Pod, get_logs: bool) -> Tuple[State, Optional[str]]:
+        # Streaming of logs from k8s is handled on a separate thread
+        # Note: It's possible that the main thread exits before the logging
+        #   thread has finished processing all of the logs. This is intended
+        #   behavior to handle cases where k8s API leaves the stream open
+        #   despite the Pod exiting.
         if get_logs:
-            logs = self.read_pod_logs(pod)
-            for line in logs:
-                self.log.info(line)
+            response = self.read_pod_logs(pod)
+            logging_thread = threading.Thread(
+                target=self._log_pod_logs_response,
+                args=(response,), daemon=True
+            )
+            logging_thread.start()
+
         result = None
         if self.extract_xcom:
             while self.base_container_is_running(pod):
@@ -161,6 +171,11 @@ class PodLauncher(LoggingMixin):
         if not status:
             return False
         return status.state.running is not None
+
+    def _log_pod_logs_response(self, logs: urllib3.response.HTTPResponse):
+        for line in logs:
+            self.log.info(line)
+        return None
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(3),
